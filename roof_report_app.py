@@ -1,69 +1,284 @@
 import streamlit as st
 from datetime import datetime
 from PIL import Image
-import textwrap
+
+# -------------- Domain dictionaries -------------- #
+
+ROOF_SYSTEMS = [
+    "Unknown / Not specified",
+    "SBS modified bitumen",
+    "BUR (built-up roof)",
+    "TPO",
+    "EPDM",
+    "PVC",
+    "Metal roof",
+    "Shingle roof",
+]
+
+ISSUE_TYPES = [
+    "General moisture concern",
+    "Active leak at interior",
+    "Ponding water",
+    "Blistering / ridging",
+    "Open seam / lap",
+    "Damaged flashing",
+    "Membrane puncture / tear",
+    "Mechanical damage (traffic / tools)",
+    "Clogged drain / scupper / gutter",
+    "Debris on roof",
+]
+
+LOCATIONS = [
+    "Not specified",
+    "Field of roof",
+    "Perimeter",
+    "At drain / scupper",
+    "At penetration (pipe / curb / unit)",
+    "At parapet / wall detail",
+    "At roof edge / metal flashing",
+]
 
 # -------------- Helper functions -------------- #
 
-def infer_severity_and_urgency(notes: str):
+def infer_severity_and_urgency(notes: str, issue_type: str, active_leak: bool):
     """
-    Very simple heuristic to guess severity & urgency
-    based on keywords in the notes.
-    This is intentionally basic so it never gets in the way.
+    Simple heuristic to guess severity & urgency
+    based on issue type and whether an active leak is reported.
     """
-    text = notes.lower()
+    text = (notes or "").lower()
 
+    # Defaults
     severity = "Moderate"
     urgency = "Soon"
 
-    high_keywords = ["active leak", "leak", "emergency", "major", "severe", "collapse"]
-    low_keywords = ["hairline", "minor", "cosmetic", "monitor", "stain only"]
-
-    if any(word in text for word in high_keywords):
+    if active_leak or "active leak" in text or "leak" in text:
         severity = "High"
         urgency = "Immediate"
-    elif any(word in text for word in low_keywords):
+        return severity, urgency
+
+    high_issues = {
+        "Membrane puncture / tear",
+        "Open seam / lap",
+        "Damaged flashing",
+        "Clogged drain / scupper / gutter",
+    }
+    low_issues = {
+        "Debris on roof",
+        "Blistering / ridging",
+        "Mechanical damage (traffic / tools)",
+        "General moisture concern",
+    }
+
+    if issue_type in high_issues:
+        severity = "High"
+        urgency = "Soon"
+    elif issue_type in low_issues:
         severity = "Low"
         urgency = "Routine"
 
     return severity, urgency
 
 
-def generate_report(notes: str, severity: str | None = None, urgency: str | None = None):
+def build_probable_cause(system: str, issue_type: str, location: str) -> str:
     """
-    Turn rough notes into a structured report.
-    This is template-based on purpose: simple, predictable, easy to adjust.
+    Rule-based 'probable cause' generator.
     """
+    base = []
 
-    # Fallback if user left notes empty
-    if not notes.strip():
-        notes = "No detailed notes were provided. Observations based on visual inspection only."
+    # Issue-driven cause
+    if issue_type == "Ponding water":
+        base.append(
+            "Limited drainage in this area, likely due to insufficient slope, "
+            "improper crickets, or partially obstructed drains or scuppers."
+        )
+    elif issue_type == "Blistering / ridging":
+        base.append(
+            "Trapped moisture or poor adhesion within the membrane or underlying layers, "
+            "often related to age, installation quality, or prior moisture entry."
+        )
+    elif issue_type == "Open seam / lap":
+        base.append(
+            "Seam failure from aging, thermal movement, or inadequate original bonding."
+        )
+    elif issue_type == "Damaged flashing":
+        base.append(
+            "Movement of building components, thermal cycling, or mechanical impact at the detail."
+        )
+    elif issue_type == "Membrane puncture / tear":
+        base.append(
+            "Mechanical damage from foot traffic, dropped tools, or displaced equipment."
+        )
+    elif issue_type == "Mechanical damage (traffic / tools)":
+        base.append(
+            "Concentrated activity in this area without adequate protection or walkways."
+        )
+    elif issue_type == "Clogged drain / scupper / gutter":
+        base.append(
+            "Accumulated debris restricting water flow at drain, scupper, or gutter components."
+        )
+    elif issue_type == "Debris on roof":
+        base.append(
+            "Wind-blown debris or housekeeping issues, which can trap moisture and block drainage."
+        )
+    elif issue_type == "Active leak at interior":
+        base.append(
+            "Water migration through the roof assembly, likely originating near a detail, "
+            "penetration, or historical repair in the vicinity of the reported leak."
+        )
+    else:
+        base.append(
+            "Moisture-related concern observed in this area. Exact source to be confirmed through further investigation."
+        )
 
-    auto_sev, auto_urg = infer_severity_and_urgency(notes)
+    # System-specific note
+    if system in {"SBS modified bitumen", "BUR (built-up roof)"}:
+        base.append(
+            " On this type of system, age-related wear, prior repairs, and surface cracking can "
+            "contribute to moisture entry if not maintained."
+        )
+    elif system in {"TPO", "EPDM", "PVC"}:
+        base.append(
+            " Single-ply membranes are sensitive to seam integrity, punctures, and detail flashing "
+            "conditions, especially around penetrations and terminations."
+        )
+    elif system == "Metal roof":
+        base.append(
+            " Metal systems often develop issues at fasteners, panel laps, and terminations as sealants age "
+            "and movement occurs."
+        )
+    elif system == "Shingle roof":
+        base.append(
+            " Shingle roofs typically leak at flashings, transitions, or where fasteners and sealants have aged."
+        )
 
-    if severity is None or severity == "Auto":
-        severity = auto_sev
-    if urgency is None or urgency == "Auto":
-        urgency = auto_urg
+    # Location-specific note
+    if location == "At drain / scupper":
+        base.append(
+            " Issues at drainage points can accelerate membrane wear and increase the risk of interior leakage."
+        )
+    elif location == "At penetration (pipe / curb / unit)":
+        base.append(
+            " Penetration details are common leak sources if flashing height, terminations, or sealants are compromised."
+        )
+    elif location == "At parapet / wall detail":
+        base.append(
+            " Transitions between horizontal and vertical surfaces are sensitive to movement and detailing quality."
+        )
+    elif location == "At roof edge / metal flashing":
+        base.append(
+            " Edge metal, terminations, and perimeter details are exposed to wind uplift and weathering."
+        )
 
-    # Very simple "parsing" of notes into sections.
-    # You can refine this over time.
-    issue_observed = notes.strip()
+    return "".join(base)
 
-    probable_cause = (
-        "Based on the description provided, the issue is likely related to either "
-        "age-related membrane wear, drainage limitations, or localized damage. "
-        "Further on-site investigation is recommended to confirm root cause."
+
+def build_recommendations(issue_type: str, active_leak: bool) -> str:
+    """
+    Rule-based recommendations based on issue type and whether there is an active leak.
+    """
+    recs = []
+
+    if active_leak:
+        recs.append(
+            "- Address active leak as a priority to limit interior damage and disruption."
+        )
+
+    # Issue-specific actions
+    if issue_type == "Ponding water":
+        recs.extend([
+            "- Clear debris from drains, scuppers, and nearby areas to restore flow.",
+            "- Verify slope and consider adding tapered insulation or crickets if ponding persists.",
+        ])
+    elif issue_type == "Blistering / ridging":
+        recs.extend([
+            "- Monitor blistered or ridged areas for growth or splitting.",
+            "- Repair or replace compromised sections where membrane integrity is at risk.",
+        ])
+    elif issue_type == "Open seam / lap":
+        recs.extend([
+            "- Clean and properly prepare the seam area.",
+            "- Install compatible membrane or flashing repair per manufacturer guidance.",
+        ])
+    elif issue_type == "Damaged flashing":
+        recs.extend([
+            "- Remove loose or failed flashing materials.",
+            "- Install new flashing with proper terminations and sealant.",
+        ])
+    elif issue_type == "Membrane puncture / tear":
+        recs.extend([
+            "- Trim loose or damaged membrane.",
+            "- Install a properly sized patch extending beyond the damaged area.",
+        ])
+    elif issue_type == "Mechanical damage (traffic / tools)":
+        recs.extend([
+            "- Repair damaged areas and consider adding walkway pads in high-traffic zones.",
+        ])
+    elif issue_type == "Clogged drain / scupper / gutter":
+        recs.extend([
+            "- Remove debris and verify that water can drain freely.",
+            "- Implement regular housekeeping or maintenance to keep drainage points clear.",
+        ])
+    elif issue_type == "Debris on roof":
+        recs.extend([
+            "- Remove debris from roof surface and drainage areas.",
+            "- Implement a routine housekeeping schedule.",
+        ])
+    else:
+        recs.extend([
+            "- Perform a closer inspection of the affected area and adjacent details.",
+            "- Complete localized repairs as required to restore watertightness.",
+        ])
+
+    recs.append(
+        "- Reinspect after a significant rainfall event to confirm that the issue has been resolved."
     )
 
-    recommendations = textwrap.dedent(
-        """
-        - Perform a closer inspection of the affected area, including surrounding seams and penetrations.
-        - Remove debris and verify that all drains, scuppers, and gutters are clear and functional.
-        - Repair or replace damaged membrane, flashings, or sealant as needed.
-        - Monitor the area after the next significant rainfall to confirm that the issue has been resolved.
-        """
-    ).strip()
+    return "\n".join(recs)
+
+
+def generate_report(
+    system: str,
+    issue_type: str,
+    location: str,
+    notes: str,
+    active_leak: bool,
+    severity_choice: str,
+    urgency_choice: str,
+):
+    """
+    Build a structured report from user selections + notes.
+    """
+
+    notes = (notes or "").strip()
+
+    # Severity / urgency
+    auto_sev, auto_urg = infer_severity_and_urgency(notes, issue_type, active_leak)
+
+    severity = auto_sev if severity_choice == "Auto" else severity_choice
+    urgency = auto_urg if urgency_choice == "Auto" else urgency_choice
+
+    # Issue observed
+    parts = []
+
+    if issue_type != "General moisture concern":
+        parts.append(issue_type)
+    else:
+        parts.append("Moisture-related concern reported")
+
+    if system != "Unknown / Not specified":
+        parts.append(f"on a {system} system")
+
+    if location != "Not specified":
+        parts.append(f"at/near: {location.lower()}")
+
+    issue_observed = " ".join(parts) + "."
+
+    if notes:
+        issue_observed += f"\n\nField notes: {notes}"
+
+    # Cause & recommendations
+    probable_cause = build_probable_cause(system, issue_type, location)
+    recommendations = build_recommendations(issue_type, active_leak)
 
     report = f"""
 ### 1. Issue Observed
@@ -83,7 +298,6 @@ def generate_report(notes: str, severity: str | None = None, urgency: str | None
 """
     return report
 
-
 # -------------- Streamlit UI -------------- #
 
 st.set_page_config(
@@ -93,26 +307,47 @@ st.set_page_config(
 )
 
 st.title("🧱 Roof Photo → Report Generator")
-st.caption("Demo tool – turns a photo + rough notes into a clean, structured report.")
+st.caption("Turns a roof photo + a few quick selections into a structured inspection-style summary.")
 
 st.markdown("---")
 
-# Upload section
 uploaded_image = st.file_uploader(
     "1️⃣ Upload a roof photo (JPEG/PNG)",
     type=["jpg", "jpeg", "png"]
 )
 
+system = st.selectbox(
+    "2️⃣ Roof system (if known)",
+    options=ROOF_SYSTEMS,
+    index=0,
+)
+
+issue_type = st.selectbox(
+    "3️⃣ Main issue observed",
+    options=ISSUE_TYPES,
+    index=0,
+)
+
+location = st.selectbox(
+    "4️⃣ Approximate location on roof",
+    options=LOCATIONS,
+    index=0,
+)
+
+active_leak = st.checkbox(
+    "Active interior leak reported for this area",
+    value=False
+)
+
 notes = st.text_area(
-    "2️⃣ Paste or type your rough notes / observations",
+    "5️⃣ Optional field notes / observations",
     placeholder=(
         "Example:\n"
-        "- Active leak reported above unit 302\n"
-        "- Ponding water around drain\n"
-        "- Blistering in modified bitumen near parapet\n"
-        "- Temporary repair already in place"
+        "- Leak reported above unit 302\n"
+        "- Ceiling tile staining near window\n"
+        "- Existing patch at drain looks aged"
     ),
-    height=180
+    height=160
 )
 
 col1, col2, col3 = st.columns(3)
@@ -121,14 +356,12 @@ with col1:
         "Severity",
         options=["Auto", "Low", "Moderate", "High"],
         index=0,
-        help="You can override the automatic severity if you want."
     )
 with col2:
     urgency_choice = st.selectbox(
         "Urgency",
         options=["Auto", "Routine", "Soon", "Immediate"],
         index=0,
-        help="You can override the automatic urgency if you want."
     )
 with col3:
     show_meta = st.checkbox("Show meta info", value=True)
@@ -141,7 +374,6 @@ if generate_btn:
     if uploaded_image is None and not notes.strip():
         st.warning("Please upload at least a photo **or** provide some notes.")
     else:
-        # Display the image (if provided)
         if uploaded_image is not None:
             img = Image.open(uploaded_image)
             st.subheader("Photo Preview")
@@ -150,9 +382,13 @@ if generate_btn:
         st.subheader("Generated Report")
 
         report_md = generate_report(
+            system=system,
+            issue_type=issue_type,
+            location=location,
             notes=notes,
-            severity=severity_choice,
-            urgency=urgency_choice
+            active_leak=active_leak,
+            severity_choice=severity_choice,
+            urgency_choice=urgency_choice,
         )
         st.markdown(report_md)
 
@@ -160,6 +396,6 @@ if generate_btn:
             st.markdown("---")
             st.caption(
                 f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}  \n"
-                "Note: This is a demo tool intended to support field documentation. "
-                "Final assessment should always be confirmed by a qualified roofing professional."
+                "Note: This tool supports field documentation. Final assessment should always be "
+                "confirmed by a qualified roofing professional."
             )
