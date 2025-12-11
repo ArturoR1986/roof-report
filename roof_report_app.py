@@ -1,6 +1,16 @@
+import os
 import streamlit as st
 from datetime import datetime
 from PIL import Image
+from openai import OpenAI
+
+# -------------- OpenAI client -------------- #
+
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
 
 # -------------- Domain dictionaries -------------- #
 
@@ -38,23 +48,16 @@ LOCATIONS = [
     "At roof edge / metal flashing",
 ]
 
-# -------------- Helper functions -------------- #
+# -------------- Helper functions (rules) -------------- #
 
 def infer_severity_and_urgency(notes: str, issue_type: str, active_leak: bool):
-    """
-    Simple heuristic to guess severity & urgency
-    based on issue type and whether an active leak is reported.
-    """
     text = (notes or "").lower()
 
-    # Defaults
     severity = "Moderate"
     urgency = "Soon"
 
     if active_leak or "active leak" in text or "leak" in text:
-        severity = "High"
-        urgency = "Immediate"
-        return severity, urgency
+        return "High", "Immediate"
 
     high_issues = {
         "Membrane puncture / tear",
@@ -70,22 +73,16 @@ def infer_severity_and_urgency(notes: str, issue_type: str, active_leak: bool):
     }
 
     if issue_type in high_issues:
-        severity = "High"
-        urgency = "Soon"
+        severity, urgency = "High", "Soon"
     elif issue_type in low_issues:
-        severity = "Low"
-        urgency = "Routine"
+        severity, urgency = "Low", "Routine"
 
     return severity, urgency
 
 
 def build_probable_cause(system: str, issue_type: str, location: str) -> str:
-    """
-    Rule-based 'probable cause' generator.
-    """
     base = []
 
-    # Issue-driven cause
     if issue_type == "Ponding water":
         base.append(
             "Limited drainage in this area, likely due to insufficient slope, "
@@ -130,7 +127,6 @@ def build_probable_cause(system: str, issue_type: str, location: str) -> str:
             "Moisture-related concern observed in this area. Exact source to be confirmed through further investigation."
         )
 
-    # System-specific note
     if system in {"SBS modified bitumen", "BUR (built-up roof)"}:
         base.append(
             " On this type of system, age-related wear, prior repairs, and surface cracking can "
@@ -151,7 +147,6 @@ def build_probable_cause(system: str, issue_type: str, location: str) -> str:
             " Shingle roofs typically leak at flashings, transitions, or where fasteners and sealants have aged."
         )
 
-    # Location-specific note
     if location == "At drain / scupper":
         base.append(
             " Issues at drainage points can accelerate membrane wear and increase the risk of interior leakage."
@@ -173,9 +168,6 @@ def build_probable_cause(system: str, issue_type: str, location: str) -> str:
 
 
 def build_recommendations(issue_type: str, active_leak: bool) -> str:
-    """
-    Rule-based recommendations based on issue type and whether there is an active leak.
-    """
     recs = []
 
     if active_leak:
@@ -183,7 +175,6 @@ def build_recommendations(issue_type: str, active_leak: bool) -> str:
             "- Address active leak as a priority to limit interior damage and disruption."
         )
 
-    # Issue-specific actions
     if issue_type == "Ponding water":
         recs.extend([
             "- Clear debris from drains, scuppers, and nearby areas to restore flow.",
@@ -245,19 +236,13 @@ def generate_report(
     severity_choice: str,
     urgency_choice: str,
 ):
-    """
-    Build a structured report from user selections + notes.
-    """
-
     notes = (notes or "").strip()
 
-    # Severity / urgency
     auto_sev, auto_urg = infer_severity_and_urgency(notes, issue_type, active_leak)
 
     severity = auto_sev if severity_choice == "Auto" else severity_choice
     urgency = auto_urg if urgency_choice == "Auto" else urgency_choice
 
-    # Issue observed
     parts = []
 
     if issue_type != "General moisture concern":
@@ -276,7 +261,6 @@ def generate_report(
     if notes:
         issue_observed += f"\n\nField notes: {notes}"
 
-    # Cause & recommendations
     probable_cause = build_probable_cause(system, issue_type, location)
     recommendations = build_recommendations(issue_type, active_leak)
 
@@ -296,7 +280,64 @@ def generate_report(
 ### 5. Urgency
 **{urgency}**
 """
-    return report
+    return report, severity, urgency
+
+# -------------- GPT enhancement -------------- #
+
+def enhance_with_gpt(client: OpenAI | None, base_report: str, meta: dict) -> str:
+    """
+    Ask GPT to rewrite the report for clarity while respecting the facts.
+    If client is None (no API key), just return the base report unchanged.
+    """
+    if client is None:
+        return base_report
+
+    system = meta.get("system")
+    issue_type = meta.get("issue_type")
+    location = meta.get("location")
+    severity = meta.get("severity")
+    urgency = meta.get("urgency")
+
+    system_prompt = (
+        "You are a roofing inspection report editor. "
+        "You will receive a draft report and some structured context. "
+        "Your job is to rewrite the report so it is clear, concise, and professional.\n\n"
+        "IMPORTANT RULES:\n"
+        "- Do NOT invent roof conditions or membrane types that are not explicitly given.\n"
+        "- Do NOT change the severity or urgency values: keep them exactly the same.\n"
+        "- Do NOT add details about locations or components that are not mentioned.\n"
+        "- If information is missing or not specified, leave it as general; do NOT guess.\n"
+        "- Keep the same general structure: Issue Observed, Probable Cause, Recommendations, Severity, Urgency.\n"
+        "- You may improve wording and flow, and you may merge or split sentences for clarity.\n"
+    )
+
+    user_content = f"""
+Context:
+- Roof system: {system}
+- Main issue: {issue_type}
+- Location: {location}
+- Severity: {severity}
+- Urgency: {urgency}
+
+Draft report (markdown):
+{base_report}
+
+Rewrite this report following the rules above.
+"""
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.3,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        # Fallback: if anything goes wrong, just return the base report
+        return base_report + f"\n\n> Note: AI enhancement failed: {e}"
 
 # -------------- Streamlit UI -------------- #
 
@@ -350,7 +391,7 @@ notes = st.text_area(
     height=160
 )
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     severity_choice = st.selectbox(
         "Severity",
@@ -365,6 +406,8 @@ with col2:
     )
 with col3:
     show_meta = st.checkbox("Show meta info", value=True)
+with col4:
+    use_ai = st.checkbox("Enhance wording with AI", value=False)
 
 generate_btn = st.button("⚙️ Generate Report", type="primary")
 
@@ -381,7 +424,7 @@ if generate_btn:
 
         st.subheader("Generated Report")
 
-        report_md = generate_report(
+        base_report, sev, urg = generate_report(
             system=system,
             issue_type=issue_type,
             location=location,
@@ -390,7 +433,27 @@ if generate_btn:
             severity_choice=severity_choice,
             urgency_choice=urgency_choice,
         )
-        st.markdown(report_md)
+
+        client = get_openai_client()
+        if use_ai and client is None:
+            st.info(
+                "AI enhancement is enabled, but no OPENAI_API_KEY is configured. "
+                "Showing base report instead."
+            )
+            final_report = base_report
+        elif use_ai and client is not None:
+            meta = {
+                "system": system,
+                "issue_type": issue_type,
+                "location": location,
+                "severity": sev,
+                "urgency": urg,
+            }
+            final_report = enhance_with_gpt(client, base_report, meta)
+        else:
+            final_report = base_report
+
+        st.markdown(final_report)
 
         if show_meta:
             st.markdown("---")
