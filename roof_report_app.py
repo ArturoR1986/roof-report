@@ -308,3 +308,5 @@ if generate_btn:
             f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}  \n"
             "Note: This tool supports documentation. Final assessment should be confirmed by a qualified roofing professional."
         )
+
+
