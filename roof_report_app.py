@@ -3,6 +3,7 @@ import json
 import streamlit as st
 from datetime import datetime
 from openai import OpenAI
+from openai import RateLimitError, APIError, APITimeoutError  # ✅ added
 
 # -------------------- OpenAI client -------------------- #
 
@@ -59,44 +60,64 @@ REPORT_TEMPLATE_HEADER = """### 1. Issue Observed
 """
 
 def safe_json_load(text: str):
-    # Try to parse JSON safely; if the model returns junk, raise a clear error.
+    # If the model returns non-JSON, this will throw and be caught upstream.
     return json.loads(text)
 
 def normalize_notes_with_gpt(client: OpenAI, notes: str):
-    completion = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": NORMALIZE_SYSTEM_PROMPT},
-            {"role": "user", "content": notes},
-        ],
-        temperature=0.2,
-    )
-    raw = completion.choices[0].message.content
-    data = safe_json_load(raw)
-    return data, raw
+    """
+    Returns: (data_or_None, raw_json_or_None, err_message_or_None)
+    Never throws to Streamlit UI.
+    """
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": NORMALIZE_SYSTEM_PROMPT},
+                {"role": "user", "content": notes},
+            ],
+            temperature=0.2,
+            max_tokens=800,  # ✅ cost / verbosity control
+        )
+        raw = completion.choices[0].message.content
+        data = safe_json_load(raw)
+        return data, raw, None
+
+    except RateLimitError:
+        return None, None, (
+            "AI is temporarily unavailable due to usage/rate limits (often billing/credits/limits). "
+            "Use Manual Normalize below or try again later."
+        )
+    except (APITimeoutError, APIError) as e:
+        return None, None, f"AI service error: {e}"
+    except json.JSONDecodeError:
+        return None, None, (
+            "AI returned a response that was not valid JSON. "
+            "Try again, or use Manual Normalize below."
+        )
+    except Exception as e:
+        return None, None, f"Unexpected error: {e}"
 
 def build_probable_cause(structured: dict) -> str:
-    """
-    Conservative 'probable cause' builder:
-    - If not enough info, state that cause needs confirmation.
-    - Do not invent technical specifics.
-    """
     issue = (structured.get("primary_issue") or "Not specified").lower()
     roof_system = structured.get("roof_system") or "Not specified"
     location = structured.get("location") or "Not specified"
 
     if issue in ["active leak", "leak", "active interior leak", "active leak at interior"]:
-        base = "Water entry is reported. The source may be near a roof detail or condition in the vicinity, but requires confirmation on-site."
+        base = ("Water entry is reported. The source may be near a roof detail or condition in the vicinity, "
+                "but requires confirmation on-site.")
     elif "pond" in issue:
-        base = "Ponding/standing water is indicated. This is commonly associated with drainage limitations, slope conditions, or obstructions, and should be confirmed by inspection."
+        base = ("Ponding/standing water is indicated. This is commonly associated with drainage limitations, "
+                "slope conditions, or obstructions, and should be confirmed by inspection.")
     elif "seam" in issue or "open lap" in issue:
-        base = "An opening or weakness at seams/laps is indicated. Seam integrity issues can lead to water entry and should be verified and repaired per system requirements."
+        base = ("An opening or weakness at seams/laps is indicated. Seam integrity issues can lead to water entry "
+                "and should be verified and repaired per system requirements.")
     elif "flashing" in issue:
-        base = "A flashing/detail concern is indicated. Movement, aging sealant, or termination issues can contribute to leakage risk and should be inspected."
+        base = ("A flashing/detail concern is indicated. Movement, aging sealant, or termination issues can contribute "
+                "to leakage risk and should be inspected.")
     else:
-        base = "Cause is not specified in the notes and should be confirmed through closer inspection of the area and adjacent details."
+        base = ("Cause is not specified in the notes and should be confirmed through closer inspection of the area "
+                "and adjacent details.")
 
-    # Light contextual note (no guessing)
     extras = []
     if roof_system != "Not specified":
         extras.append(f"Roof system noted: {roof_system}.")
@@ -172,7 +193,7 @@ st.caption("Turns messy field notes into a consistent report. (Editor-first appr
 
 client = get_client()
 if client is None:
-    st.warning("OPENAI_API_KEY not found. Add it to Streamlit Secrets (cloud) or set it locally. The AI features will not run.")
+    st.warning("OPENAI_API_KEY not found. AI Normalize will not run. Manual Normalize is available below.")
 else:
     st.success("AI is available (OPENAI_API_KEY found).")
 
@@ -186,35 +207,97 @@ notes = st.text_area(
 
 colA, colB = st.columns(2)
 with colA:
-    normalize_btn = st.button("🧹 Normalize Notes", type="primary")
+    normalize_btn = st.button("🧹 Normalize Notes (AI)", type="primary")
 with colB:
     generate_btn = st.button("📝 Generate Report")
 
 if "structured" not in st.session_state:
     st.session_state.structured = None
 
+# ---- AI Normalize ----
 if normalize_btn:
     if not notes.strip():
         st.error("Paste some notes first.")
     elif client is None:
-        st.error("AI not available. Set OPENAI_API_KEY first.")
+        st.error("AI not available. Set OPENAI_API_KEY first (Streamlit Cloud Secrets).")
     else:
         with st.spinner("Normalizing notes…"):
-            structured, raw_json = normalize_notes_with_gpt(client, notes)
+            structured, raw_json, err = normalize_notes_with_gpt(client, notes)
+
+        if err:
+            st.error(err)
+            st.info("Tip: Use Manual Normalize below to keep working even if AI is unavailable.")
+        else:
             st.session_state.structured = structured
+            st.subheader("Normalized Record (structured)")
+            st.json(st.session_state.structured)
 
-        st.subheader("Normalized Record (structured)")
-        st.json(st.session_state.structured)
+            questions = structured.get("clarifying_questions") or []
+            if questions:
+                st.info("Clarifying questions (answering these will improve accuracy):")
+                for q in questions:
+                    st.write(f"- {q}")
 
-        questions = structured.get("clarifying_questions") or []
-        if questions:
-            st.info("Clarifying questions (answering these will improve accuracy):")
-            for q in questions:
-                st.write(f"- {q}")
+# ---- Manual Normalize (fallback) ----
+st.markdown("---")
+st.subheader("Manual Normalize (fallback)")
 
+m_col1, m_col2 = st.columns(2)
+with m_col1:
+    m_roof_system = st.selectbox(
+        "Roof system",
+        ["Not specified", "TPO", "EPDM", "PVC", "SBS modified bitumen", "BUR", "Metal", "Shingle"]
+    )
+    m_primary_issue = st.selectbox(
+        "Primary issue",
+        ["Not specified", "Active leak", "Ponding", "Open seam / lap", "Flashing concern",
+         "Puncture / tear", "Clogged drain / scupper", "Debris", "Moisture concern"]
+    )
+
+with m_col2:
+    m_location = st.selectbox(
+        "Location",
+        ["Not specified", "Field", "Perimeter", "At drain / scupper", "At penetration",
+         "At parapet / wall detail", "At roof edge / metal"]
+    )
+    m_active_leak = st.checkbox("Active leak reported", value=False)
+
+m_obs = st.text_area(
+    "Observations (bullets or sentences)",
+    height=120,
+    placeholder="- What did you see?\n- What did the customer report?"
+)
+m_steps = st.text_area(
+    "Recommended next steps (optional)",
+    height=120,
+    placeholder="- What should happen next?"
+)
+
+m_severity = st.selectbox("Severity", ["Low", "Moderate", "High"], index=1)
+m_urgency = st.selectbox("Urgency", ["Routine", "Soon", "Immediate"], index=1)
+
+manual_btn = st.button("✅ Use Manual Normalized Data")
+if manual_btn:
+    st.session_state.structured = {
+        "job_summary": "Manual entry provided.",
+        "roof_system": m_roof_system,
+        "primary_issue": m_primary_issue,
+        "location": m_location,
+        "active_leak_reported": bool(m_active_leak),
+        "observations": [x.strip("- ").strip() for x in m_obs.splitlines() if x.strip()],
+        "constraints_or_unknowns": [],
+        "recommended_next_steps": [x.strip("- ").strip() for x in m_steps.splitlines() if x.strip()] if m_steps.strip() else [],
+        "severity": m_severity,
+        "urgency": m_urgency,
+        "clarifying_questions": [],
+    }
+    st.success("Manual normalized record loaded.")
+    st.json(st.session_state.structured)
+
+# ---- Generate Report ----
 if generate_btn:
     if st.session_state.structured is None:
-        st.error("Click 'Normalize Notes' first.")
+        st.error("Click 'Normalize Notes (AI)' or 'Use Manual Normalized Data' first.")
     else:
         st.subheader("Generated Report")
         report = build_report(st.session_state.structured)
