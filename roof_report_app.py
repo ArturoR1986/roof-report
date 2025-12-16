@@ -265,11 +265,8 @@ def build_customer_report(customer: dict) -> str:
 def generate_customer_from_internal(internal: dict) -> dict:
     """
     Manual-mode helper: creates a simple customer-friendly translation without AI.
-    (Not perfect, but keeps the workflow moving.)
     """
     issue = internal.get("primary_issue", "Not specified")
-    loc = internal.get("location", "Not specified")
-    roof = internal.get("roof_system", "Not specified")
     conditions = internal.get("installation_site_conditions", [])
     concerns = internal.get("potential_concerns", [])
     steps = internal.get("recommended_next_steps", [])
@@ -284,6 +281,92 @@ def generate_customer_from_internal(internal: dict) -> dict:
         "recommended_next_steps": steps,
         "priority": internal.get("urgency", "Soon"),
     }
+
+# -------------------- Exports (TXT / DOCX / PDF) -------------------- #
+
+def to_txt_bytes(s: str) -> bytes:
+    return (s or "").strip().encode("utf-8")
+
+def md_to_plain_lines(md: str) -> list[str]:
+    """
+    Very light markdown-to-plain conversion for exports.
+    Keeps bullets and headings readable.
+    """
+    lines = []
+    for raw in (md or "").splitlines():
+        line = raw.strip()
+        if not line:
+            lines.append("")
+            continue
+        # remove bold markers but keep text
+        line = line.replace("**", "")
+        lines.append(line)
+    return lines
+
+def make_docx_bytes(title: str, md_body: str) -> bytes:
+    """
+    Creates a simple DOCX (office-friendly).
+    Requires python-docx.
+    """
+    from io import BytesIO
+    try:
+        from docx import Document
+    except Exception as e:
+        raise RuntimeError("python-docx is not installed. Add it to requirements.txt.") from e
+
+    doc = Document()
+    doc.add_heading(title, level=1)
+
+    for line in md_to_plain_lines(md_body):
+        if line.startswith("- "):
+            doc.add_paragraph(line[2:], style="List Bullet")
+        elif line.startswith("## "):
+            doc.add_heading(line[3:], level=2)
+        elif line.startswith("# "):
+            doc.add_heading(line[2:], level=1)
+        else:
+            doc.add_paragraph(line)
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+def make_pdf_bytes(title: str, md_body: str) -> bytes:
+    """
+    Creates a simple PDF.
+    Requires reportlab.
+    """
+    from io import BytesIO
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+    except Exception as e:
+        raise RuntimeError("reportlab is not installed. Add it to requirements.txt.") from e
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+
+    x = 54
+    y = height - 54
+    line_height = 14
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x, y, title)
+    y -= (line_height * 2)
+
+    c.setFont("Helvetica", 11)
+    for line in md_to_plain_lines(md_body):
+        # simple page break
+        if y <= 54:
+            c.showPage()
+            y = height - 54
+            c.setFont("Helvetica", 11)
+        c.drawString(x, y, line[:110])  # simple truncation; keeps PDF generation reliable
+        y -= line_height
+
+    c.save()
+    return buf.getvalue()
 
 # -------------------- Streamlit UI -------------------- #
 
@@ -446,13 +529,16 @@ if generate_btn:
         internal = data.get("internal_report", {})
         customer = data.get("customer_report", {})
 
+        internal_md = build_internal_report(internal)
+        customer_md = build_customer_report(customer)
+
         tab1, tab2, tab3 = st.tabs(["Internal (Default)", "Customer-Friendly", "Debug JSON"])
 
         with tab1:
-            st.markdown(build_internal_report(internal))
+            st.markdown(internal_md)
 
         with tab2:
-            st.markdown(build_customer_report(customer))
+            st.markdown(customer_md)
 
         with tab3:
             st.json(data)
@@ -461,6 +547,77 @@ if generate_btn:
                 st.code(st.session_state.raw_json, language="json")
 
         st.markdown("---")
+        st.subheader("⬇️ Export (office-friendly)")
+
+        ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+        base = f"AllianceRoofing_RoofReport_{ts}"
+
+        col1, col2, col3 = st.columns(3)
+
+        # TXT
+        with col1:
+            st.download_button(
+                "Download Internal (.txt)",
+                data=to_txt_bytes(internal_md),
+                file_name=f"{base}_INTERNAL.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            st.download_button(
+                "Download Customer (.txt)",
+                data=to_txt_bytes(customer_md),
+                file_name=f"{base}_CUSTOMER.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            st.download_button(
+                "Download Data (.json)",
+                data=json.dumps(data, indent=2).encode("utf-8"),
+                file_name=f"{base}_DATA.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+        # DOCX
+        with col2:
+            try:
+                st.download_button(
+                    "Download Internal (.docx)",
+                    data=make_docx_bytes("INTERNAL / MANUFACTURER-SAFE REPORT", internal_md),
+                    file_name=f"{base}_INTERNAL.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "Download Customer (.docx)",
+                    data=make_docx_bytes("CUSTOMER-FRIENDLY REPORT", customer_md),
+                    file_name=f"{base}_CUSTOMER.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"DOCX export unavailable: {e}")
+
+        # PDF
+        with col3:
+            try:
+                st.download_button(
+                    "Download Internal (.pdf)",
+                    data=make_pdf_bytes("INTERNAL / MANUFACTURER-SAFE REPORT", internal_md),
+                    file_name=f"{base}_INTERNAL.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "Download Customer (.pdf)",
+                    data=make_pdf_bytes("CUSTOMER-FRIENDLY REPORT", customer_md),
+                    file_name=f"{base}_CUSTOMER.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"PDF export unavailable: {e}")
+
         st.caption(
             f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}  \n"
             "Note: This tool supports documentation. Final assessment should be confirmed by a qualified roofing professional."
