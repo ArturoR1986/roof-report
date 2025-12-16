@@ -3,7 +3,7 @@ import json
 import streamlit as st
 from datetime import datetime
 from openai import OpenAI
-from openai import RateLimitError, APIError, APITimeoutError  # ✅ added
+from openai import RateLimitError, APIError, APITimeoutError
 
 # -------------------- OpenAI client -------------------- #
 
@@ -15,53 +15,151 @@ def get_client():
 
 # -------------------- Prompting -------------------- #
 
-NORMALIZE_SYSTEM_PROMPT = """
-You are an assistant for roofing service documentation.
-Your job: take messy field notes (often incomplete, shorthand, or voice transcript)
-and produce a clean structured record WITHOUT inventing facts.
+DUAL_OUTPUT_SYSTEM_PROMPT = """
+You are a senior roofing service manager and technical writer.
 
-CRITICAL RULES:
-- Do NOT guess membrane type, roof system, building details, or causes if not explicitly stated.
-- If something is unknown, set it to "Not specified".
-- If the note is unclear, ask clarifying questions.
-- Use only information present in the notes; you may rephrase for clarity.
-- Output MUST be valid JSON only, no extra text.
+You translate vague, shorthand roofer field notes into professional documentation.
 
-Return JSON with exactly these keys:
+You must produce TWO versions of the same report:
+1) INTERNAL / MANUFACTURER-SAFE (authoritative default)
+2) CUSTOMER-FRIENDLY (translation derived from internal)
+
+Key behavior:
+- Roofers often omit details; you may reasonably infer implications using common roofing practice.
+- Use manufacturer-recognizable language (proper adhesion, acceptable installation conditions, substrate conditions)
+  WITHOUT citing exact specs, temperature numbers, product SKUs, manufacturer names, or warranty conclusions.
+- Do NOT assign blame.
+- Use qualified language (“likely”, “may”, “appears”) when certainty is limited.
+
+Active leaks:
+- Set active_leak_reported = true ONLY if the notes explicitly state an active leak or water intrusion.
+- If not stated, set false.
+- You may mention “risk of leakage” only as a potential concern if supported by the notes.
+
+Output MUST be valid JSON only (no markdown, no extra text).
+
+Return JSON with EXACTLY these keys:
+
 {
-  "job_summary": string,
-  "roof_system": string,              // e.g., "TPO", "SBS modified bitumen", or "Not specified"
-  "primary_issue": string,            // e.g., "Active leak", "Ponding", "Open seam", or "Not specified"
-  "location": string,                 // e.g., "at drain", "at penetration", or "Not specified"
-  "active_leak_reported": boolean,
-  "observations": [string],           // bullets; only what is supported by notes
-  "constraints_or_unknowns": [string],// missing info, unclear items
-  "recommended_next_steps": [string], // practical steps; keep conservative
-  "severity": "Low"|"Moderate"|"High",
-  "urgency": "Routine"|"Soon"|"Immediate",
-  "clarifying_questions": [string]    // ask only if needed
+  "internal_report": {
+    "service_summary": string,
+    "roof_system": string,
+    "primary_issue": string,
+    "location": string,
+    "active_leak_reported": boolean,
+    "observations": [string],
+    "installation_site_conditions": [string],
+    "potential_concerns": [string],
+    "recommended_next_steps": [string],
+    "severity": "Low"|"Moderate"|"High",
+    "urgency": "Routine"|"Soon"|"Immediate"
+  },
+  "customer_report": {
+    "what_we_found": string,
+    "why_this_matters": string,
+    "what_this_could_lead_to": [string],
+    "recommended_next_steps": [string],
+    "priority": "Routine"|"Soon"|"Immediate"
+  },
+  "clarifying_questions": [string]
 }
+
+Rules:
+- If unknown, use "Not specified" for strings, [] for lists, and false for booleans (unless explicitly true).
+- The customer_report must NOT introduce new facts beyond internal_report.
 """
 
-REPORT_TEMPLATE_HEADER = """### 1. Issue Observed
-{issue_observed}
+# -------------------- JSON safety & validation -------------------- #
 
-### 2. Probable Cause
-{probable_cause}
+def safe_json_load(text: str) -> dict:
+    """
+    Strict JSON parse with a small salvage attempt if the model wraps JSON.
+    """
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start:end+1])
+        raise
 
-### 3. Recommendations
-{recommendations}
+def _as_str(v, default="Not specified"):
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
 
-### 4. Severity
-**{severity}**
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        t = v.strip().lower()
+        if t in {"true", "yes", "y"}:
+            return True
+        if t in {"false", "no", "n"}:
+            return False
+    return False
 
-### 5. Urgency
-**{urgency}**
-"""
+def _as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str) and v.strip():
+        return [v.strip()]
+    return []
 
-def safe_json_load(text: str):
-    # If the model returns non-JSON, this will throw and be caught upstream.
-    return json.loads(text)
+SEVERITY_SET = {"Low", "Moderate", "High"}
+URGENCY_SET = {"Routine", "Soon", "Immediate"}
+
+def normalize_and_validate_dual(data: dict) -> dict:
+    """
+    Ensures required structure exists and types are sane.
+    Fills missing fields with safe defaults.
+    Ignores extra keys safely.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Parsed JSON is not an object.")
+
+    internal = data.get("internal_report") if isinstance(data.get("internal_report"), dict) else {}
+    customer = data.get("customer_report") if isinstance(data.get("customer_report"), dict) else {}
+
+    out = {
+        "internal_report": {
+            "service_summary": _as_str(internal.get("service_summary")),
+            "roof_system": _as_str(internal.get("roof_system")),
+            "primary_issue": _as_str(internal.get("primary_issue")),
+            "location": _as_str(internal.get("location")),
+            "active_leak_reported": _as_bool(internal.get("active_leak_reported")),
+            "observations": _as_list(internal.get("observations")),
+            "installation_site_conditions": _as_list(internal.get("installation_site_conditions")),
+            "potential_concerns": _as_list(internal.get("potential_concerns")),
+            "recommended_next_steps": _as_list(internal.get("recommended_next_steps")),
+            "severity": _as_str(internal.get("severity"), "Moderate").title(),
+            "urgency": _as_str(internal.get("urgency"), "Soon").title(),
+        },
+        "customer_report": {
+            "what_we_found": _as_str(customer.get("what_we_found")),
+            "why_this_matters": _as_str(customer.get("why_this_matters")),
+            "what_this_could_lead_to": _as_list(customer.get("what_this_could_lead_to")),
+            "recommended_next_steps": _as_list(customer.get("recommended_next_steps")),
+            "priority": _as_str(customer.get("priority"), "Soon").title(),
+        },
+        "clarifying_questions": _as_list(data.get("clarifying_questions")),
+    }
+
+    if out["internal_report"]["severity"] not in SEVERITY_SET:
+        out["internal_report"]["severity"] = "Moderate"
+    if out["internal_report"]["urgency"] not in URGENCY_SET:
+        out["internal_report"]["urgency"] = "Soon"
+    if out["customer_report"]["priority"] not in URGENCY_SET:
+        out["customer_report"]["priority"] = out["internal_report"]["urgency"]
+
+    return out
+
+# -------------------- OpenAI call -------------------- #
 
 def normalize_notes_with_gpt(client: OpenAI, notes: str):
     """
@@ -72,15 +170,17 @@ def normalize_notes_with_gpt(client: OpenAI, notes: str):
         completion = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
-                {"role": "system", "content": NORMALIZE_SYSTEM_PROMPT},
+                {"role": "system", "content": DUAL_OUTPUT_SYSTEM_PROMPT},
                 {"role": "user", "content": notes},
             ],
+            response_format={"type": "json_object"},  # ✅ JSON mode
             temperature=0.2,
-            max_tokens=800,  # ✅ cost / verbosity control
+            max_tokens=1100,
         )
         raw = completion.choices[0].message.content
-        data = safe_json_load(raw)
-        return data, raw, None
+        parsed = safe_json_load(raw)
+        validated = normalize_and_validate_dual(parsed)
+        return validated, raw, None
 
     except RateLimitError:
         return None, None, (
@@ -97,99 +197,100 @@ def normalize_notes_with_gpt(client: OpenAI, notes: str):
     except Exception as e:
         return None, None, f"Unexpected error: {e}"
 
-def build_probable_cause(structured: dict) -> str:
-    issue = (structured.get("primary_issue") or "Not specified").lower()
-    roof_system = structured.get("roof_system") or "Not specified"
-    location = structured.get("location") or "Not specified"
+# -------------------- Report rendering -------------------- #
 
-    if issue in ["active leak", "leak", "active interior leak", "active leak at interior"]:
-        base = ("Water entry is reported. The source may be near a roof detail or condition in the vicinity, "
-                "but requires confirmation on-site.")
-    elif "pond" in issue:
-        base = ("Ponding/standing water is indicated. This is commonly associated with drainage limitations, "
-                "slope conditions, or obstructions, and should be confirmed by inspection.")
-    elif "seam" in issue or "open lap" in issue:
-        base = ("An opening or weakness at seams/laps is indicated. Seam integrity issues can lead to water entry "
-                "and should be verified and repaired per system requirements.")
-    elif "flashing" in issue:
-        base = ("A flashing/detail concern is indicated. Movement, aging sealant, or termination issues can contribute "
-                "to leakage risk and should be inspected.")
-    else:
-        base = ("Cause is not specified in the notes and should be confirmed through closer inspection of the area "
-                "and adjacent details.")
+def _bullets(items):
+    if not items:
+        return "- Not specified"
+    return "\n".join([f"- {x}" for x in items])
 
-    extras = []
-    if roof_system != "Not specified":
-        extras.append(f"Roof system noted: {roof_system}.")
-    if location != "Not specified":
-        extras.append(f"Location noted: {location}.")
+def build_internal_report(internal: dict) -> str:
+    leak = "Yes" if internal.get("active_leak_reported") else "No / Not reported"
 
-    if extras:
-        return base + " " + " ".join(extras)
-    return base
+    return f"""
+## INTERNAL / MANUFACTURER-SAFE REPORT
 
-def build_issue_observed(structured: dict) -> str:
-    parts = []
-    issue = structured.get("primary_issue") or "Not specified"
-    roof_system = structured.get("roof_system") or "Not specified"
-    location = structured.get("location") or "Not specified"
-    job_summary = structured.get("job_summary") or ""
+**Service Summary**  
+{internal.get("service_summary", "Not specified")}
 
-    if job_summary.strip():
-        parts.append(job_summary.strip())
-    else:
-        parts.append(f"Primary issue: {issue}.")
+**Roof System**  
+{internal.get("roof_system", "Not specified")}
 
-    if roof_system != "Not specified":
-        parts.append(f"Roof system: {roof_system}.")
-    if location != "Not specified":
-        parts.append(f"Location: {location}.")
+**Primary Issue**  
+{internal.get("primary_issue", "Not specified")}
 
-    obs = structured.get("observations") or []
-    if obs:
-        parts.append("\nObservations:")
-        for o in obs:
-            parts.append(f"- {o}")
+**Location**  
+{internal.get("location", "Not specified")}
 
-    unknowns = structured.get("constraints_or_unknowns") or []
-    if unknowns:
-        parts.append("\nUnknown / needs confirmation:")
-        for u in unknowns:
-            parts.append(f"- {u}")
+**Active Leak Reported**  
+**{leak}**
 
-    return "\n".join(parts)
+**Observations**
+{_bullets(internal.get("observations", []))}
 
-def build_recommendations(structured: dict) -> str:
-    steps = structured.get("recommended_next_steps") or []
-    if not steps:
-        steps = [
-            "Perform closer inspection of the reported area and surrounding details.",
-            "Complete localized repairs as required to restore watertightness.",
-            "Reinspect after the next significant rainfall event."
-        ]
-    return "\n".join([f"- {s}" for s in steps])
+**Installation / Site Conditions**
+{_bullets(internal.get("installation_site_conditions", []))}
 
-def build_report(structured: dict) -> str:
-    issue_observed = build_issue_observed(structured)
-    probable_cause = build_probable_cause(structured)
-    recommendations = build_recommendations(structured)
-    severity = structured.get("severity") or "Moderate"
-    urgency = structured.get("urgency") or "Soon"
+**Potential Concerns**
+{_bullets(internal.get("potential_concerns", []))}
 
-    return REPORT_TEMPLATE_HEADER.format(
-        issue_observed=issue_observed,
-        probable_cause=probable_cause,
-        recommendations=recommendations,
-        severity=severity,
-        urgency=urgency
-    )
+**Recommended Next Steps**
+{_bullets(internal.get("recommended_next_steps", []))}
+
+**Severity / Urgency**
+- **Severity:** {internal.get("severity", "Moderate")}
+- **Urgency:** {internal.get("urgency", "Soon")}
+""".strip()
+
+def build_customer_report(customer: dict) -> str:
+    return f"""
+## CUSTOMER-FRIENDLY REPORT
+
+**What We Found**  
+{customer.get("what_we_found", "Not specified")}
+
+**Why This Matters**  
+{customer.get("why_this_matters", "Not specified")}
+
+**What This Could Lead To**
+{_bullets(customer.get("what_this_could_lead_to", []))}
+
+**Recommended Next Steps**
+{_bullets(customer.get("recommended_next_steps", []))}
+
+**Priority**
+**{customer.get("priority", "Soon")}**
+""".strip()
+
+def generate_customer_from_internal(internal: dict) -> dict:
+    """
+    Manual-mode helper: creates a simple customer-friendly translation without AI.
+    (Not perfect, but keeps the workflow moving.)
+    """
+    issue = internal.get("primary_issue", "Not specified")
+    loc = internal.get("location", "Not specified")
+    roof = internal.get("roof_system", "Not specified")
+    conditions = internal.get("installation_site_conditions", [])
+    concerns = internal.get("potential_concerns", [])
+    steps = internal.get("recommended_next_steps", [])
+
+    conditions_line = " ".join(conditions) if conditions else ""
+    why = conditions_line if conditions_line else "Further conditions/details were not specified in the notes."
+
+    return {
+        "what_we_found": f"We identified a concern related to: {issue}.",
+        "why_this_matters": why,
+        "what_this_could_lead_to": concerns,
+        "recommended_next_steps": steps,
+        "priority": internal.get("urgency", "Soon"),
+    }
 
 # -------------------- Streamlit UI -------------------- #
 
 st.set_page_config(page_title="Roof Notes → Report", page_icon="🧱", layout="centered")
 
-st.title("🧱 Roof Notes → Report Generator")
-st.caption("Turns messy field notes into a consistent report. (Editor-first approach)")
+st.title("🧱 Roof Notes → Dual Report Generator")
+st.caption("Creates an INTERNAL manufacturer-safe record (default) + a CUSTOMER-friendly version.")
 
 client = get_client()
 if client is None:
@@ -201,18 +302,27 @@ st.markdown("---")
 
 notes = st.text_area(
     "Paste messy notes / voice transcript",
-    placeholder="Example: leak above 302, staining ceiling tile, old patch near curb. was raining last night. check RTU area.",
+    placeholder="Example: too cold, glue not sticking, flashing hard to stretch, possible voids at corners.",
     height=180
 )
 
-colA, colB = st.columns(2)
+colA, colB, colC = st.columns([1, 1, 1])
 with colA:
-    normalize_btn = st.button("🧹 Normalize Notes (AI)", type="primary")
+    normalize_btn = st.button("🧹 Normalize Notes (AI)", type="primary", use_container_width=True)
 with colB:
-    generate_btn = st.button("📝 Generate Report")
+    generate_btn = st.button("📝 Show Reports", use_container_width=True)
+with colC:
+    clear_btn = st.button("🧽 Clear", use_container_width=True)
 
 if "structured" not in st.session_state:
     st.session_state.structured = None
+if "raw_json" not in st.session_state:
+    st.session_state.raw_json = None
+
+if clear_btn:
+    st.session_state.structured = None
+    st.session_state.raw_json = None
+    st.rerun()
 
 # ---- AI Normalize ----
 if normalize_btn:
@@ -229,7 +339,8 @@ if normalize_btn:
             st.info("Tip: Use Manual Normalize below to keep working even if AI is unavailable.")
         else:
             st.session_state.structured = structured
-            st.subheader("Normalized Record (structured)")
+            st.session_state.raw_json = raw_json
+            st.subheader("Normalized Record (debug)")
             st.json(st.session_state.structured)
 
             questions = structured.get("clarifying_questions") or []
@@ -240,7 +351,7 @@ if normalize_btn:
 
 # ---- Manual Normalize (fallback) ----
 st.markdown("---")
-st.subheader("Manual Normalize (fallback)")
+st.subheader("Manual Normalize (fallback) — Internal / Manufacturer-Safe (default)")
 
 m_col1, m_col2 = st.columns(2)
 with m_col1:
@@ -251,62 +362,106 @@ with m_col1:
     m_primary_issue = st.selectbox(
         "Primary issue",
         ["Not specified", "Active leak", "Ponding", "Open seam / lap", "Flashing concern",
-         "Puncture / tear", "Clogged drain / scupper", "Debris", "Moisture concern"]
+         "Puncture / tear", "Clogged drain / scupper", "Debris", "Moisture concern", "Adhesion / install limitation"]
     )
-
 with m_col2:
     m_location = st.selectbox(
         "Location",
         ["Not specified", "Field", "Perimeter", "At drain / scupper", "At penetration",
-         "At parapet / wall detail", "At roof edge / metal"]
+         "At parapet / wall detail", "At roof edge / metal", "At corners", "At flashing detail"]
     )
     m_active_leak = st.checkbox("Active leak reported", value=False)
 
-m_obs = st.text_area(
-    "Observations (bullets or sentences)",
-    height=120,
-    placeholder="- What did you see?\n- What did the customer report?"
+m_service_summary = st.text_area(
+    "Service summary (internal)",
+    height=90,
+    placeholder="Short, manufacturer-safe summary of what happened."
 )
+
+m_obs = st.text_area(
+    "Observations (one per line)",
+    height=110,
+    placeholder="- Roof covered in snow\n- Adhesive not bonding\n- Flashing difficult to stretch"
+)
+
+m_conditions = st.text_area(
+    "Installation / site conditions (one per line)",
+    height=90,
+    placeholder="- Extreme cold\n- Falling snow\n- Snow-covered substrate"
+)
+
+m_concerns = st.text_area(
+    "Potential concerns (one per line)",
+    height=90,
+    placeholder="- Potential voids at corners\n- Risk of incomplete adhesion"
+)
+
 m_steps = st.text_area(
-    "Recommended next steps (optional)",
-    height=120,
-    placeholder="- What should happen next?"
+    "Recommended next steps (one per line)",
+    height=110,
+    placeholder="- Reinspect once conditions improve\n- Complete adhesion work under suitable conditions"
 )
 
 m_severity = st.selectbox("Severity", ["Low", "Moderate", "High"], index=1)
 m_urgency = st.selectbox("Urgency", ["Routine", "Soon", "Immediate"], index=1)
 
-manual_btn = st.button("✅ Use Manual Normalized Data")
+manual_btn = st.button("✅ Use Manual Internal Data", use_container_width=True)
+
+def _lines(txt: str):
+    return [x.strip().lstrip("-").strip() for x in (txt or "").splitlines() if x.strip()]
+
 if manual_btn:
-    st.session_state.structured = {
-        "job_summary": "Manual entry provided.",
+    internal = {
+        "service_summary": m_service_summary.strip() if m_service_summary.strip() else "Manual entry provided.",
         "roof_system": m_roof_system,
         "primary_issue": m_primary_issue,
         "location": m_location,
         "active_leak_reported": bool(m_active_leak),
-        "observations": [x.strip("- ").strip() for x in m_obs.splitlines() if x.strip()],
-        "constraints_or_unknowns": [],
-        "recommended_next_steps": [x.strip("- ").strip() for x in m_steps.splitlines() if x.strip()] if m_steps.strip() else [],
+        "observations": _lines(m_obs),
+        "installation_site_conditions": _lines(m_conditions),
+        "potential_concerns": _lines(m_concerns),
+        "recommended_next_steps": _lines(m_steps),
         "severity": m_severity,
         "urgency": m_urgency,
+    }
+
+    structured = {
+        "internal_report": internal,
+        "customer_report": generate_customer_from_internal(internal),
         "clarifying_questions": [],
     }
-    st.success("Manual normalized record loaded.")
+
+    st.session_state.structured = normalize_and_validate_dual(structured)
+    st.session_state.raw_json = None
+
+    st.success("Manual internal record loaded.")
     st.json(st.session_state.structured)
 
-# ---- Generate Report ----
+# ---- Show Reports ----
 if generate_btn:
     if st.session_state.structured is None:
-        st.error("Click 'Normalize Notes (AI)' or 'Use Manual Normalized Data' first.")
+        st.error("Click 'Normalize Notes (AI)' or 'Use Manual Internal Data' first.")
     else:
-        st.subheader("Generated Report")
-        report = build_report(st.session_state.structured)
-        st.markdown(report)
+        data = st.session_state.structured
+        internal = data.get("internal_report", {})
+        customer = data.get("customer_report", {})
+
+        tab1, tab2, tab3 = st.tabs(["Internal (Default)", "Customer-Friendly", "Debug JSON"])
+
+        with tab1:
+            st.markdown(build_internal_report(internal))
+
+        with tab2:
+            st.markdown(build_customer_report(customer))
+
+        with tab3:
+            st.json(data)
+            if st.session_state.raw_json:
+                st.caption("Raw AI output (for debugging):")
+                st.code(st.session_state.raw_json, language="json")
 
         st.markdown("---")
         st.caption(
             f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}  \n"
             "Note: This tool supports documentation. Final assessment should be confirmed by a qualified roofing professional."
         )
-
-
