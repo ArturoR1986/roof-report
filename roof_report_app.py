@@ -298,7 +298,6 @@ def md_to_plain_lines(md: str) -> list[str]:
         if not line:
             lines.append("")
             continue
-        # remove bold markers but keep text
         line = line.replace("**", "")
         lines.append(line)
     return lines
@@ -357,12 +356,11 @@ def make_pdf_bytes(title: str, md_body: str) -> bytes:
 
     c.setFont("Helvetica", 11)
     for line in md_to_plain_lines(md_body):
-        # simple page break
         if y <= 54:
             c.showPage()
             y = height - 54
             c.setFont("Helvetica", 11)
-        c.drawString(x, y, line[:110])  # simple truncation; keeps PDF generation reliable
+        c.drawString(x, y, line[:110])
         y -= line_height
 
     c.save()
@@ -381,30 +379,57 @@ if client is None:
 else:
     st.success("AI is available (OPENAI_API_KEY found).")
 
-st.markdown("---")
-
-notes = st.text_area(
-    "Paste messy notes / voice transcript",
-    placeholder="Example: too cold, glue not sticking, flashing hard to stretch, possible voids at corners.",
-    height=180
-)
-
-colA, colB, colC = st.columns([1, 1, 1])
-with colA:
-    normalize_btn = st.button("🧹 Normalize Notes (AI)", type="primary", use_container_width=True)
-with colB:
-    generate_btn = st.button("📝 Show Reports", use_container_width=True)
-with colC:
-    clear_btn = st.button("🧽 Clear", use_container_width=True)
+# ---------- Session state init ----------
 
 if "structured" not in st.session_state:
     st.session_state.structured = None
 if "raw_json" not in st.session_state:
     st.session_state.raw_json = None
 
+def reset_report_state(clear_notes: bool = False):
+    # Clear outputs + clarifications
+    for k in ["structured", "raw_json", "clarify_answers", "clarify_questions_cache"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+    # Clear manual widget values (requires widget keys)
+    for k in [
+        "m_roof_system","m_primary_issue","m_location","m_active_leak",
+        "m_service_summary","m_obs","m_conditions","m_concerns","m_steps",
+        "m_severity","m_urgency",
+    ]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+    # Optionally clear notes
+    if clear_notes and "notes_input" in st.session_state:
+        del st.session_state["notes_input"]
+
+st.markdown("---")
+
+notes = st.text_area(
+    "Paste messy notes / voice transcript",
+    placeholder="Example: too cold, glue not sticking, flashing hard to stretch, possible voids at corners.",
+    height=180,
+    key="notes_input",
+)
+
+colA, colB, colC, colD = st.columns([1, 1, 1, 1])
+with colA:
+    normalize_btn = st.button("🧹 Normalize Notes (AI)", type="primary", use_container_width=True)
+with colB:
+    generate_btn = st.button("📝 Show Reports", use_container_width=True)
+with colC:
+    clear_btn = st.button("🧽 Clear Output Only", use_container_width=True)
+with colD:
+    new_btn = st.button("🆕 Start New Report", use_container_width=True)
+
 if clear_btn:
-    st.session_state.structured = None
-    st.session_state.raw_json = None
+    reset_report_state(clear_notes=False)
+    st.rerun()
+
+if new_btn:
+    reset_report_state(clear_notes=True)
     st.rerun()
 
 # ---- AI Normalize ----
@@ -423,14 +448,57 @@ if normalize_btn:
         else:
             st.session_state.structured = structured
             st.session_state.raw_json = raw_json
+
             st.subheader("Normalized Record (debug)")
             st.json(st.session_state.structured)
 
+            # ---------- Clarifying Q&A → Refine ----------
             questions = structured.get("clarifying_questions") or []
             if questions:
-                st.info("Clarifying questions (answering these will improve accuracy):")
-                for q in questions:
-                    st.write(f"- {q}")
+                st.markdown("---")
+                st.subheader("🧾 Clarifying Questions (Optional)")
+                st.caption("Answer what you can. Leave blank if unknown. Then click Refine.")
+
+                st.session_state.clarify_questions_cache = questions
+                if "clarify_answers" not in st.session_state:
+                    st.session_state.clarify_answers = {}
+
+                with st.form("clarify_form"):
+                    for i, q in enumerate(st.session_state.clarify_questions_cache):
+                        k = f"clarify_{i}"
+                        st.session_state.clarify_answers[k] = st.text_input(
+                            q,
+                            value=st.session_state.clarify_answers.get(k, ""),
+                        )
+                    refine_btn = st.form_submit_button("🔁 Refine with Answers")
+
+                if refine_btn:
+                    answered_lines = []
+                    for i, q in enumerate(st.session_state.clarify_questions_cache):
+                        a = (st.session_state.clarify_answers.get(f"clarify_{i}", "") or "").strip()
+                        if a:
+                            answered_lines.append(f"- Q: {q}\n  A: {a}")
+
+                    if not answered_lines:
+                        st.info("No answers provided. Add at least one answer to refine.")
+                    else:
+                        notes_plus = (
+                            "ORIGINAL ROOFER NOTES:\n"
+                            f"{notes.strip()}\n\n"
+                            "OFFICE CLARIFICATIONS (authoritative):\n"
+                            + "\n".join(answered_lines)
+                        )
+
+                        with st.spinner("Refining report with clarifications…"):
+                            refined, raw2, err2 = normalize_notes_with_gpt(client, notes_plus)
+
+                        if err2:
+                            st.error(err2)
+                        else:
+                            st.session_state.structured = refined
+                            st.session_state.raw_json = raw2
+                            st.success("Refined using clarifications.")
+                            st.json(refined)
 
 # ---- Manual Normalize (fallback) ----
 st.markdown("---")
@@ -440,53 +508,61 @@ m_col1, m_col2 = st.columns(2)
 with m_col1:
     m_roof_system = st.selectbox(
         "Roof system",
-        ["Not specified", "TPO", "EPDM", "PVC", "SBS modified bitumen", "BUR", "Metal", "Shingle"]
+        ["Not specified", "TPO", "EPDM", "PVC", "SBS modified bitumen", "BUR", "Metal", "Shingle"],
+        key="m_roof_system",
     )
     m_primary_issue = st.selectbox(
         "Primary issue",
         ["Not specified", "Active leak", "Ponding", "Open seam / lap", "Flashing concern",
-         "Puncture / tear", "Clogged drain / scupper", "Debris", "Moisture concern", "Adhesion / install limitation"]
+         "Puncture / tear", "Clogged drain / scupper", "Debris", "Moisture concern", "Adhesion / install limitation"],
+        key="m_primary_issue",
     )
 with m_col2:
     m_location = st.selectbox(
         "Location",
         ["Not specified", "Field", "Perimeter", "At drain / scupper", "At penetration",
-         "At parapet / wall detail", "At roof edge / metal", "At corners", "At flashing detail"]
+         "At parapet / wall detail", "At roof edge / metal", "At corners", "At flashing detail"],
+        key="m_location",
     )
-    m_active_leak = st.checkbox("Active leak reported", value=False)
+    m_active_leak = st.checkbox("Active leak reported", value=False, key="m_active_leak")
 
 m_service_summary = st.text_area(
     "Service summary (internal)",
     height=90,
-    placeholder="Short, manufacturer-safe summary of what happened."
+    placeholder="Short, manufacturer-safe summary of what happened.",
+    key="m_service_summary",
 )
 
 m_obs = st.text_area(
     "Observations (one per line)",
     height=110,
-    placeholder="- Roof covered in snow\n- Adhesive not bonding\n- Flashing difficult to stretch"
+    placeholder="- Roof covered in snow\n- Adhesive not bonding\n- Flashing difficult to stretch",
+    key="m_obs",
 )
 
 m_conditions = st.text_area(
     "Installation / site conditions (one per line)",
     height=90,
-    placeholder="- Extreme cold\n- Falling snow\n- Snow-covered substrate"
+    placeholder="- Extreme cold\n- Falling snow\n- Snow-covered substrate",
+    key="m_conditions",
 )
 
 m_concerns = st.text_area(
     "Potential concerns (one per line)",
     height=90,
-    placeholder="- Potential voids at corners\n- Risk of incomplete adhesion"
+    placeholder="- Potential voids at corners\n- Risk of incomplete adhesion",
+    key="m_concerns",
 )
 
 m_steps = st.text_area(
     "Recommended next steps (one per line)",
     height=110,
-    placeholder="- Reinspect once conditions improve\n- Complete adhesion work under suitable conditions"
+    placeholder="- Reinspect once conditions improve\n- Complete adhesion work under suitable conditions",
+    key="m_steps",
 )
 
-m_severity = st.selectbox("Severity", ["Low", "Moderate", "High"], index=1)
-m_urgency = st.selectbox("Urgency", ["Routine", "Soon", "Immediate"], index=1)
+m_severity = st.selectbox("Severity", ["Low", "Moderate", "High"], index=1, key="m_severity")
+m_urgency = st.selectbox("Urgency", ["Routine", "Soon", "Immediate"], index=1, key="m_urgency")
 
 manual_btn = st.button("✅ Use Manual Internal Data", use_container_width=True)
 
@@ -554,7 +630,7 @@ if generate_btn:
 
         col1, col2, col3 = st.columns(3)
 
-        # TXT
+        # TXT / JSON
         with col1:
             st.download_button(
                 "Download Internal (.txt)",
